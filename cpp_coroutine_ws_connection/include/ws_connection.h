@@ -167,10 +167,10 @@ class WebSocketConnection : private boost::noncopyable {
         if (ec) [[unlikely]] {
             logger_->error("conn {}: close error: {}", connectionID(), ec.message());
         }
-        is_connected_ = false;
         read_buffer_.consume(read_buffer_.size());
         logger_->info("conn {}: disconnected {}", connectionID(), config_.ptr_url->toString());
         ptr_ws_ = nullptr;
+        is_connected_ = false;
     }
 
     /**
@@ -265,10 +265,8 @@ class WebSocketConnection : private boost::noncopyable {
             tcp_layer.expires_never();
             is_connected_ = true;
             if (config_.additional_heartbeat_ping_sec > 0) {
-                error_code _ec;
-                // scheduleNextActivePing(_ec);
                 boost::asio::co_spawn(io_ctx_.get_executor()
-                                    , std::bind(&WebSocketConnection::scheduleNextActivePing, this)
+                                    , std::bind(&WebSocketConnection::schedulePing, this)
                                     , boost::asio::detached);
                 logger_->info("conn {}: application heartbeat frequency: {} sec",
                               connectionID(), config_.additional_heartbeat_ping_sec);
@@ -309,7 +307,7 @@ class WebSocketConnection : private boost::noncopyable {
         return ptr_ws_->next_layer();
     }
 
-    asio::awaitable<void> scheduleNextActivePing() {
+    asio::awaitable<void> schedulePing() {
         while (set_running_) {
             co_await asyncSleep(boost::posix_time::seconds(config_.additional_heartbeat_ping_sec), io_ctx_);
             if (is_waiting_for_reconnect_ || !is_connected_) [[unlikely]] {
