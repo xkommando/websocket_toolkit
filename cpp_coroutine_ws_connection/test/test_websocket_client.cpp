@@ -1,14 +1,12 @@
 
 
-#define BOOST_AUTO_TEST_MAIN
-#include <boost/test/unit_test.hpp>
-
 #include "spdlog/spdlog.h"
 #include "spdlog/sinks/stdout_color_sinks.h"
 
 #include "url.h"
 #include "ws_connection.h"
 
+#include <boost/test/unit_test.hpp>
 
 namespace ws_toolkit::test {
 
