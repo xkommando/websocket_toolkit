@@ -619,16 +619,16 @@ class SpmcQueue {
     }
 
     void publish(uint64_t index) {
-		// assert index > last_published_index_
+        // assert index > last_published_index_
         last_published_index_.store(index, std::memory_order_release);
         notifyAll();
     }
 
-	/**
-	 * get a range that has at least 'count' number of empty slots
-	 * 'next_available_index_' is set to the end of the returned range
-	 * thus the publisher must publish all slots in this range
-	*/
+    /**
+     * get a range that has at least 'count' number of empty slots
+     * 'next_available_index_' is set to the end of the returned range
+     * thus the publisher must publish all slots in this range
+    */
     BufferRange getAvailableRange(size_t count) {
         assert(count > 0);
         const auto target = static_cast<uint64_t>(next_available_index_ + (count - 1) - capacity_);
@@ -655,10 +655,10 @@ class SpmcQueue {
     inline ValueT&          at(uint64_t index) noexcept { return buffer_[index % mask_]; }
     inline const ValueT&    at(uint64_t index) const noexcept { return buffer_[index % mask_]; }
 
-	/**
-	 * recommend creating all consumers before the consumer threads
-	 * the queue owns all consumer handlers
-	*/
+    /**
+     * recommend creating all consumers before the consumer threads
+     * the queue owns all consumer handlers
+    */
     ConsumerHandler *createConsumer() {
         consumers_.emplace_back(last_published_index_.load(std::memory_order_acquire), this);
         return &consumers_.back();
@@ -690,7 +690,7 @@ class SpmcQueue {
     std::mutex mutex_;
     std::condition_variable cv_;
 
-	uint64_t next_available_index_;
+    uint64_t next_available_index_;
     std::atomic_uint64_t last_published_index_;
 
     ValueT *buffer_;
