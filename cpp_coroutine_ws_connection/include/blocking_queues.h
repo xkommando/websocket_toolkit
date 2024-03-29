@@ -560,6 +560,7 @@ class SpmcQueue {
         const BufferIterator cbegin() const noexcept { return BufferIterator{q_, begin_index}; }
         const BufferIterator cend() const noexcept { return BufferIterator{q_, end_index}; }
         size_t count() const noexcept { return end_index - begin_index; }
+        bool empty() const noexcept { return begin_index == end_index; }
     };
 
     class ConsumerHandler {
@@ -595,7 +596,23 @@ class SpmcQueue {
             }
             return BufferRange(last_idx + 1, head + 1, q_);
         }
+        // todo: poll with timeout
 
+        /**
+         * peek new data and return all of them, otherwise returns an empty range
+         * will not block
+        */
+        BufferRange peek() {
+            auto last_idx = last_read_index_.load(std::memory_order_acquire);
+            auto req_idx = last_idx + 1;
+            auto head = q_->last_published_index_.load(std::memory_order_acquire);
+            int64_t diff = static_cast<int64_t>(head - req_idx);
+            if (diff >= 0) {
+                return BufferRange(last_idx + 1, head + 1, q_);
+            } else {
+                return BufferRange(last_idx, last_idx, q_);
+            }
+        }
         void markConsumed(const BufferRange &buf_range) {
             markConsumed(buf_range.end_index - 1);
         }
@@ -604,7 +621,7 @@ class SpmcQueue {
             q_->notifyAll();
         }
     };
-
+    // todo: wait for empty slot with timeout
     uint64_t nextAvailableIndex() {
         const auto target = static_cast<uint64_t>(next_available_index_ - capacity_);
         auto min_offset = minConsumerOffsetAfter(target);
@@ -623,11 +640,10 @@ class SpmcQueue {
         last_published_index_.store(index, std::memory_order_release);
         notifyAll();
     }
-
     /**
      * get a range that has at least 'count' number of empty slots
      * 'next_available_index_' is set to the end of the returned range
-     * thus the publisher must publish all slots in this range
+     * thus the publisher must publish to all slots in this range
     */
     BufferRange getAvailableRange(size_t count) {
         assert(count > 0);
@@ -645,6 +661,23 @@ class SpmcQueue {
         next_available_index_ += min_offset;
         return BufferRange(left, next_available_index_, this);
     }
+    /**
+     * check if there is empty slots available and return all of them, otherwise return an empty range.
+     * will not block
+     * publisher must publish to all slots in this range
+     */
+    BufferRange tryGetAvailableRange() {
+        const auto target = static_cast<uint64_t>(next_available_index_ - capacity_);
+        auto min_offset = minConsumerOffsetAfter(target);
+        if (min_offset < 0) {
+            return BufferRange(next_available_index_ - 1, next_available_index_ - 1, this);
+        } else {
+            uint64_t left = next_available_index_;
+            next_available_index_++;
+            next_available_index_ += min_offset;
+            return BufferRange(left, next_available_index_, this);
+        }
+    }
 
     void publish(const BufferRange &buf_range) {
         publish(buf_range.end_index - 1);
@@ -660,7 +693,7 @@ class SpmcQueue {
      * the queue owns all consumer handlers
     */
     ConsumerHandler *createConsumer() {
-        consumers_.emplace_back(last_published_index_.load(std::memory_order_acquire), this);
+        consumers_.emplace_back(last_published_index_.load(std::memory_order_relaxed), this);
         return &consumers_.back();
     }
 

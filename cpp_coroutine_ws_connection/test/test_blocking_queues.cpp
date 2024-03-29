@@ -43,16 +43,17 @@ BOOST_AUTO_TEST_CASE(benchmark_blocking_queue_1p1c) {
 
 	std::cout << "BlockingRingBuffer Benchmark\r\n";
 	for (size_t i = 0; i < run_count; ++i) {
-		std::cout << std::format("#{} {}  ops/sec\r\n", i + 1, get_ops_per_sec_1p1c(q_size, iteration_count));
+		std::cout << std::format("#{} {}  ops/sec\r\n", i + 1,
+								get_ops_per_sec_1p1c(q_size, iteration_count));
 	}
-
 }
 
-size_t get_ops_per_sec_multicast(size_t q_size, size_t iteration_count, size_t consumer_count) {
+size_t get_ops_per_sec_multicast(size_t q_size, size_t iteration_count, size_t consumer_count, bool batch_publish, bool spin_wait) {
 	SpmcQueue<uint64_t> q(q_size);
 	const size_t expected_result = iteration_count * (iteration_count - 1) / 2;
 	std::vector<std::thread> thr_consumers;
 	std::vector<decltype(q)::ConsumerHandler*> handlers;
+
 	// create consumer handlers first
 	for (size_t i = 0; i < consumer_count; ++i) {
 		handlers.push_back(q.createConsumer());
@@ -62,37 +63,86 @@ size_t get_ops_per_sec_multicast(size_t q_size, size_t iteration_count, size_t c
 			uint64_t result = 0;
 			auto* hdr = handlers[consumer_idx];
 			uint64_t count = 0;
-			while (count < iteration_count) {
-				auto rg = hdr->poll(1);
-				for (const auto& n : rg) {
-					result += n;
+			if (spin_wait) {
+				while (count < iteration_count) {
+					auto rg = hdr->peek();  // non-blocking
+					if (!rg.empty()) {
+						for (const auto& n : rg) {
+							result += n;
+						}
+						hdr->markConsumed(rg);
+						count += rg.count();
+					} else {
+						std::this_thread::yield();
+						// i.e. ASIO skip this turn
+					}
 				}
-				hdr->markConsumed(rg);
-				count += rg.count();
+			} else {
+				while (count < iteration_count) {
+					auto rg = hdr->poll(1); // blocks if no new data
+					for (const auto& n : rg) {
+						result += n;
+					}
+					hdr->markConsumed(rg);
+					count += rg.count();
+				}
 			}
 			if (result != expected_result) {
 				std::cerr << std::format("#{} bad result: expected {}, got {}\r\n", i, expected_result, result) << std::flush;
 			}
 		}, i);
 	}
+
 	const auto start = std::chrono::high_resolution_clock::now();
-	std::thread thr_producer([&](){
-		uint64_t i = 0;
-		// publish in batches
-		while (i < iteration_count - q_size) {
-			auto rg = q.getAvailableRange(1);
-			for (auto& n : rg) {
-				n = i++;
+			
+	std::thread thr_producer([&]() {
+		if (batch_publish) {// try to publish in batches 
+			uint64_t i = 0;
+			if (spin_wait) {
+				while (i < iteration_count - q_size) {
+					auto rg = q.tryGetAvailableRange(); // non-blocking
+					if (!rg.empty()) {
+						for (auto& n : rg) {
+							n = i++;
+						}
+						q.publish(rg);
+					} else {
+						std::this_thread::yield();
+						// i.e. ASIO skip this turn
+					}
+				}
+			} else {
+				while (i < iteration_count - q_size) {
+					auto rg = q.getAvailableRange(1);// blocks if no empty slots, ie there are slow consumers
+					for (auto& n : rg) {
+						n = i++;
+					}
+					q.publish(rg);
+				}
 			}
-			q.publish(rg);
+			while (i < iteration_count) {
+				auto idx = q.nextAvailableIndex();
+				q[idx] = i;
+				q.publish(i);
+				++i;
+			}
+		} else { // publish one by one	
+			uint64_t i = 0;
+			if (spin_wait) {
+				throw std::runtime_error("cannot publish one by one in spin wait mode");
+			} else {
+				while (i < iteration_count) {
+					auto idx = q.nextAvailableIndex();
+					q[idx] = i;
+					q.publish(i);
+					++i;
+				}
+			}
+
 		}
-		while (i < iteration_count) {
-			auto idx = q.nextAvailableIndex();
-			q[idx] = i;
-			q.publish(i);
-			++i;
-		}
+
 	});
+	
 	for (auto& t : thr_consumers) {
 		t.join();
 	}
@@ -106,12 +156,22 @@ size_t get_ops_per_sec_multicast(size_t q_size, size_t iteration_count, size_t c
 BOOST_AUTO_TEST_CASE(benchmark_blocking_queue_multicast) {
 	size_t run_count = 4;
 	size_t consumer_count = 2;
-	size_t q_size = 256;
-	size_t iteration_count = 10 * 1000 * 1000;
+	size_t q_size = 512;
+	size_t iteration_count = 20 * 1000 * 1000;
 
-	std::cout << "MPMC Queue Benchmark\r\n";
+	std::cout << std::format("MPMC Queue Benchmark\r\nqueue size:{}\titerations:{}\tmulticast group size:{}\r\n"
+						, q_size, iteration_count, consumer_count) << std::flush;
+	std::cout << "blocking wait non-batching:\r\n";
 	for (size_t i = 0; i < run_count; ++i) {
-		std::cout << std::format("#{} {}  ops/sec\r\n", i + 1, get_ops_per_sec_multicast(q_size, iteration_count, consumer_count));
+		std::cout << std::format("#{} {} ops/sec\r\n", i + 1, get_ops_per_sec_multicast(q_size, iteration_count, consumer_count, false, false));
+	}
+	std::cout << "blocking batch publish:\r\n";
+	for (size_t i = 0; i < run_count; ++i) {
+		std::cout << std::format("#{} {} ops/sec\r\n", i + 1, get_ops_per_sec_multicast(q_size, iteration_count, consumer_count, true, false));
+	}
+	std::cout << "spin wait batch publish:\r\n";
+	for (size_t i = 0; i < run_count; ++i) {
+		std::cout << std::format("#{} {} ops/sec\r\n", i + 1, get_ops_per_sec_multicast(q_size, iteration_count, consumer_count, true, true));
 	}
 }
 
