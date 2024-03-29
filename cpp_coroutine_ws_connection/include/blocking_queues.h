@@ -443,6 +443,8 @@ private:
 /**
  * single-producer-multi-consumer queue,
  * can be used to implement multicast patterns
+ *
+ * todo: add/remove consumers on the fly
  */
 template<typename ValueT, typename Allocator = std::allocator<ValueT> >
 class SpmcQueue {
@@ -565,8 +567,7 @@ class SpmcQueue {
 
     class ConsumerHandler {
 #pragma GCC diagnostic ignored "-Winterference-size"
-        alignas(std::hardware_destructive_interference_size)
-        std::atomic_uint64_t last_read_index_;
+        alignas(std::hardware_destructive_interference_size) std::atomic_uint64_t last_read_index_;
 #pragma GCC diagnostic pop
         SpmcQueue *q_;
         friend SpmcQueue;
@@ -576,7 +577,7 @@ class SpmcQueue {
 
         /**
          * poll at least 'count' number of items
-        */
+         */
         BufferRange poll(size_t count) {
 			assert(count > 0);
             auto last_idx = last_read_index_.load(std::memory_order_acquire);
@@ -596,12 +597,37 @@ class SpmcQueue {
             }
             return BufferRange(last_idx + 1, head + 1, q_);
         }
-        // todo: poll with timeout
+        /**
+         * * @return an empty range if timed out
+         */
+        template<typename Rep, typename Period>
+        BufferRange poll(size_t count, const std::chrono::duration<Rep, Period>& timeout) {
+            assert(count > 0);
+            auto last_idx = last_read_index_.load(std::memory_order_acquire);
+            auto req_idx = last_idx + count;
+            auto head = q_->last_published_index_.load(std::memory_order_acquire);
+            // overflow -> negative
+            int64_t diff = static_cast<int64_t>(head - req_idx);
+            if (diff < 0) {
+                std::unique_lock<std::mutex> lock(q_->mutex_);
+                q_->cv_.wait_for(lock, timeout, [&]() {
+                  last_idx = last_read_index_.load(std::memory_order_acquire);
+                  req_idx = last_idx + count;
+                  head = q_->last_published_index_.load(std::memory_order_acquire);
+                  diff = static_cast<int64_t>(head - req_idx);
+                  return diff >= 0;
+                });
+                if (diff < 0) {
+                    return BufferRange(last_idx, last_idx, q_);
+                }
+            }
+            return BufferRange(last_idx + 1, head + 1, q_);
+        }
 
         /**
          * peek new data and return all of them, otherwise returns an empty range
          * will not block
-        */
+         */
         BufferRange peek() {
             auto last_idx = last_read_index_.load(std::memory_order_acquire);
             auto req_idx = last_idx + 1;
@@ -621,7 +647,7 @@ class SpmcQueue {
             q_->notifyAll();
         }
     };
-    // todo: wait for empty slot with timeout
+
     uint64_t nextAvailableIndex() {
         const auto target = static_cast<uint64_t>(next_available_index_ - capacity_);
         auto min_offset = minConsumerOffsetAfter(target);
@@ -634,7 +660,22 @@ class SpmcQueue {
         }
         return next_available_index_++;
     }
-
+    template<typename Rep, typename Period>
+    std::optional<uint64_t> nextAvailableIndex(const std::chrono::duration<Rep, Period>& timeout) {
+        const auto target = static_cast<uint64_t>(next_available_index_ - capacity_);
+        auto min_offset = minConsumerOffsetAfter(target);
+        if (min_offset < 0) {
+            std::unique_lock<std::mutex> lock(mutex_);
+            cv_.wait_for(lock, timeout, [&]() {
+              min_offset = minConsumerOffsetAfter(target);
+              return min_offset >= 0;
+            });
+            if (min_offset < 0) {
+                return std::nullopt;
+            }
+        }
+        return next_available_index_++;
+    }
     void publish(uint64_t index) {
         // assert index > last_published_index_
         last_published_index_.store(index, std::memory_order_release);
@@ -644,7 +685,7 @@ class SpmcQueue {
      * get a range that has at least 'count' number of empty slots
      * 'next_available_index_' is set to the end of the returned range
      * thus the publisher must publish to all slots in this range
-    */
+     */
     BufferRange getAvailableRange(size_t count) {
         assert(count > 0);
         const auto target = static_cast<uint64_t>(next_available_index_ + (count - 1) - capacity_);
@@ -655,6 +696,29 @@ class SpmcQueue {
               min_offset = minConsumerOffsetAfter(target);
               return min_offset >= 0;
             });
+        }
+        uint64_t left = next_available_index_;
+        next_available_index_ += count;
+        next_available_index_ += min_offset;
+        return BufferRange(left, next_available_index_, this);
+    }
+    /**
+     * @return an empty range if timed out
+     */
+    template<typename Rep, typename Period>
+    BufferRange getAvailableRange(size_t count, const std::chrono::duration<Rep, Period>& timeout) {
+        assert(count > 0);
+        const auto target = static_cast<uint64_t>(next_available_index_ + (count - 1) - capacity_);
+        auto min_offset = minConsumerOffsetAfter(target);
+        if (min_offset < 0) {
+            std::unique_lock<std::mutex> lock(mutex_);
+            cv_.wait_for(lock, timeout, [&]() {
+              min_offset = minConsumerOffsetAfter(target);
+              return min_offset >= 0;
+            });
+            if (min_offset < 0) {
+                return BufferRange(next_available_index_ - 1, next_available_index_ - 1, this);
+            }
         }
         uint64_t left = next_available_index_;
         next_available_index_ += count;
@@ -678,7 +742,6 @@ class SpmcQueue {
             return BufferRange(left, next_available_index_, this);
         }
     }
-
     void publish(const BufferRange &buf_range) {
         publish(buf_range.end_index - 1);
     }
